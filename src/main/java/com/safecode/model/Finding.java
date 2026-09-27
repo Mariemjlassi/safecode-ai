@@ -14,6 +14,7 @@ public class Finding {
     private String issue;
     private String evidence;
     private String fix;
+    private boolean resolved;
 
     public Finding() {}
 
@@ -53,4 +54,7 @@ public class Finding {
 
     public String getFix()                   { return fix; }
     public void   setFix(String v)           { this.fix = v; }
+
+    public boolean isResolved()              { return resolved; }
+    public void    setResolved(boolean v)    { this.resolved = v; }
 }

@@ -33,4 +33,18 @@ public class AuditController {
                 .map(ResponseEntity::ok)
                 .orElse(ResponseEntity.notFound().build());
     }
+
+    /**
+     * Applies an AI-generated fix for a specific finding, confirms the fix via re-scan,
+     * and returns the updated audit with the recalculated score.
+     *
+     * <p>Supported categories: Secrets Handling (Category D).
+     * Returns HTTP 400 for any other category.
+     */
+    @PostMapping("/audit/{id}/fix/{findingId}")
+    public ResponseEntity<AuditResponse> applyFix(
+            @PathVariable Long id,
+            @PathVariable Long findingId) {
+        return ResponseEntity.ok(auditService.applyFix(id, findingId));
+    }
 }

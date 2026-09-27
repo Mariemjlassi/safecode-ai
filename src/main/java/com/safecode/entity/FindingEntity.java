@@ -39,6 +39,10 @@ public class FindingEntity {
     @Column(nullable = false, length = 1024)
     private String fix;
 
+    /** True once the fix endpoint has successfully patched and re-verified this finding. */
+    @Column(nullable = false)
+    private boolean resolved = false;
+
     @ManyToOne(fetch = FetchType.LAZY, optional = false)
     @JoinColumn(name = "audit_id", nullable = false)
     private AuditEntity audit;
@@ -87,6 +91,9 @@ public class FindingEntity {
 
     public String getFix()                           { return fix; }
     public void   setFix(String fix)                 { this.fix = fix; }
+
+    public boolean isResolved()                      { return resolved; }
+    public void    setResolved(boolean resolved)     { this.resolved = resolved; }
 
     public AuditEntity getAudit()                    { return audit; }
     public void        setAudit(AuditEntity audit)   { this.audit = audit; }

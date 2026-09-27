@@ -6,7 +6,10 @@ import com.safecode.model.AuditRequest;
 import com.safecode.model.AuditResponse;
 import com.safecode.model.Finding;
 import com.safecode.repository.AuditRepository;
+import com.safecode.repository.FindingRepository;
+import org.springframework.http.HttpStatus;
 import org.springframework.stereotype.Service;
+import org.springframework.web.server.ResponseStatusException;
 import java.util.Optional;
 
 import java.io.IOException;
@@ -41,10 +44,18 @@ import java.util.regex.Pattern;
 @Service
 public class AuditService {
 
-    private final AuditRepository auditRepository;
+    private static final String CATEGORY_SECRETS = "Secrets Handling";
 
-    public AuditService(AuditRepository auditRepository) {
-        this.auditRepository = auditRepository;
+    private final AuditRepository   auditRepository;
+    private final FindingRepository findingRepository;
+    private final CodeFixClient     codeFixClient;
+
+    public AuditService(AuditRepository auditRepository,
+                        FindingRepository findingRepository,
+                        CodeFixClient codeFixClient) {
+        this.auditRepository   = auditRepository;
+        this.findingRepository = findingRepository;
+        this.codeFixClient     = codeFixClient;
     }
 
     // -----------------------------------------------------------------------
@@ -142,6 +153,114 @@ public class AuditService {
      */
     public Optional<AuditResponse> findById(Long id) {
         return auditRepository.findById(id).map(this::toResponse);
+    }
+
+    /**
+     * Applies an AI-generated minimal fix for the given finding, re-runs the relevant
+     * category check to confirm resolution, then updates the finding and audit score.
+     *
+     * <p>Only Category D (Secrets Handling) is supported. Any other category returns
+     * HTTP 400 with "Fix not yet supported for this category".
+     *
+     * @param auditId   primary key of the audit
+     * @param findingId primary key of the finding
+     * @return updated {@link AuditResponse} with the recalculated score
+     * @throws ResponseStatusException 404 if the audit or finding is not found,
+     *                                 400 if the category is not supported or fix failed
+     */
+    public AuditResponse applyFix(Long auditId, Long findingId) {
+        // Step 1 — Load audit and finding
+        AuditEntity audit = auditRepository.findById(auditId)
+                .orElseThrow(() -> new ResponseStatusException(HttpStatus.NOT_FOUND,
+                        "Audit not found: " + auditId));
+
+        FindingEntity finding = findingRepository.findById(findingId)
+                .orElseThrow(() -> new ResponseStatusException(HttpStatus.NOT_FOUND,
+                        "Finding not found: " + findingId));
+
+        if (!finding.getAudit().getId().equals(auditId)) {
+            throw new ResponseStatusException(HttpStatus.NOT_FOUND,
+                    "Finding " + findingId + " does not belong to audit " + auditId);
+        }
+
+        // Scope gate — only Secrets Handling (Category D) is implemented
+        if (!CATEGORY_SECRETS.equals(finding.getCategory())) {
+            throw new ResponseStatusException(HttpStatus.BAD_REQUEST,
+                    "Fix not yet supported for this category");
+        }
+
+        if (finding.isResolved()) {
+            // Already fixed — return current state without re-running
+            return toResponse(audit);
+        }
+
+        // Step 2 — Clone the repo into a temp directory
+        Path tempDir = null;
+        try {
+            tempDir = Files.createTempDirectory("safecode-fix-");
+            cloneRepository(audit.getRepoUrl(), tempDir);
+
+            // Step 2b — Read the offending file from the clone
+            Path filePath = tempDir.resolve(finding.getFile().replace('/', java.io.File.separatorChar));
+            if (!Files.exists(filePath)) {
+                throw new ResponseStatusException(HttpStatus.BAD_REQUEST,
+                        "File not found in cloned repo: " + finding.getFile());
+            }
+            String originalContent = Files.readString(filePath, StandardCharsets.UTF_8);
+
+            // Step 2c — Ask LLM to produce the minimal fix
+            String patchedContent = codeFixClient.requestFix(
+                    finding.getFile(), originalContent,
+                    finding.getIssue(), finding.getFix());
+
+            // Write the patched content back
+            Files.writeString(filePath, patchedContent, StandardCharsets.UTF_8);
+
+            // Step 3 — Re-run only Category D checks on this file
+            String relPath = finding.getFile();
+            List<String> patchedLines = Files.readAllLines(filePath, StandardCharsets.UTF_8);
+            List<Finding> residualSecrets = new ArrayList<>();
+            int[] dummy = {1};
+            checkSecretsOnly(relPath, patchedLines, residualSecrets, dummy);
+
+            boolean stillVulnerable = !residualSecrets.isEmpty();
+            if (stillVulnerable) {
+                throw new ResponseStatusException(HttpStatus.BAD_REQUEST,
+                        "Fix did not eliminate all secrets findings in " + finding.getFile()
+                        + " — " + residualSecrets.size() + " issue(s) remain after patch.");
+            }
+
+            // Step 4 — Mark finding resolved, recalculate score
+            finding.setResolved(true);
+            findingRepository.save(finding);
+
+            // Recalculate score using the remaining unresolved findings
+            List<Finding> activeFindings = audit.getFindings().stream()
+                    .filter(f -> !f.isResolved())
+                    .map(fe -> new Finding(
+                            fe.getFindingRef(), fe.getCategory(), fe.getSeverity(),
+                            fe.getFile(), fe.getLine(),
+                            fe.getIssue(), fe.getEvidence(), fe.getFix()))
+                    .toList();
+            int newScore = calculateScore(activeFindings);
+            audit.setScore(newScore);
+            audit.setFindingsCount((int) audit.getFindings().stream().filter(f -> !f.isResolved()).count());
+            auditRepository.save(audit);
+
+            // Step 5 — Return updated response
+            return toResponse(audit);
+
+        } catch (ResponseStatusException e) {
+            throw e;   // propagate HTTP errors as-is
+        } catch (IOException | InterruptedException e) {
+            Thread.currentThread().interrupt();
+            throw new ResponseStatusException(HttpStatus.INTERNAL_SERVER_ERROR,
+                    "Fix failed for finding " + findingId + ": " + e.getMessage());
+        } finally {
+            if (tempDir != null) {
+                deleteDirectory(tempDir);
+            }
+        }
     }
 
     /**
@@ -387,6 +506,55 @@ public class AuditService {
         }
     }
 
+    /**
+     * Runs only the Category D (Secrets Handling) patterns against a single file's lines.
+     * Used by {@link #applyFix} to verify the patch removed the secret.
+     */
+    private void checkSecretsOnly(String relPath, List<String> lines,
+                                  List<Finding> findings, int[] counter) {
+        for (int i = 0; i < lines.size(); i++) {
+            String line = lines.get(i);
+            int lineNo = i + 1;
+
+            if (match(HARDCODED_SECRET, line)) {
+                findings.add(new Finding(
+                        id(counter), CATEGORY_SECRETS, "Critical",
+                        relPath, lineNo,
+                        "Hard-coded credential or secret found in source file.",
+                        truncate(line),
+                        "Move all credentials to environment variables or a secrets manager. "
+                        + "Rotate any exposed values immediately and audit git history."));
+            }
+            if (match(PRIVATE_KEY_BLOCK, line)) {
+                findings.add(new Finding(
+                        id(counter), CATEGORY_SECRETS, "Critical",
+                        relPath, lineNo,
+                        "Private key material committed to the repository.",
+                        truncate(line),
+                        "Remove the key from the repository and rotate it immediately. "
+                        + "Store private keys only in a secrets manager or HSM."));
+            }
+            if (match(WEAK_HASH, line)) {
+                findings.add(new Finding(
+                        id(counter), CATEGORY_SECRETS, "Medium",
+                        relPath, lineNo,
+                        "Weak hashing algorithm (MD5 or SHA-1) detected.",
+                        truncate(line),
+                        "Replace with SHA-256 or stronger for general hashing. "
+                        + "For password hashing, use bcrypt, scrypt, or Argon2."));
+            }
+            if (match(WEAK_CIPHER, line)) {
+                findings.add(new Finding(
+                        id(counter), CATEGORY_SECRETS, "Medium",
+                        relPath, lineNo,
+                        "AES used without explicit mode — defaults to insecure ECB mode.",
+                        truncate(line),
+                        "Always specify a secure mode and IV, e.g. AES/GCM/NoPadding. "
+                        + "Never use ECB mode for encrypting more than one block."));
+            }
+        }
+    }
+
     // -----------------------------------------------------------------------
     // Step 4 — Score calculation
     // -----------------------------------------------------------------------
@@ -497,15 +665,19 @@ public class AuditService {
     /** Maps a persisted {@link AuditEntity} (with its findings) to an {@link AuditResponse}. */
     private AuditResponse toResponse(AuditEntity entity) {
         List<Finding> findings = entity.getFindings().stream()
-                .map(fe -> new Finding(
-                        fe.getFindingRef(),
-                        fe.getCategory(),
-                        fe.getSeverity(),
-                        fe.getFile(),
-                        fe.getLine(),
-                        fe.getIssue(),
-                        fe.getEvidence(),
-                        fe.getFix()))
+                .map(fe -> {
+                    Finding f = new Finding(
+                            fe.getFindingRef(),
+                            fe.getCategory(),
+                            fe.getSeverity(),
+                            fe.getFile(),
+                            fe.getLine(),
+                            fe.getIssue(),
+                            fe.getEvidence(),
+                            fe.getFix());
+                    f.setResolved(fe.isResolved());
+                    return f;
+                })
                 .toList();
         return new AuditResponse(entity.getScore(), entity.getFindingsCount(), findings);
     }
