@@ -5,6 +5,8 @@ import com.safecode.entity.FindingEntity;
 import com.safecode.model.AuditRequest;
 import com.safecode.model.AuditResponse;
 import com.safecode.model.Finding;
+import com.safecode.model.FixRequest;
+import com.safecode.model.FixResponse;
 import com.safecode.repository.AuditRepository;
 import com.safecode.repository.FindingRepository;
 import org.springframework.http.HttpStatus;
@@ -156,6 +158,26 @@ public class AuditService {
     }
 
     /**
+     * Returns a {@link FixResponse} for a single finding within a given audit.
+     * The {@code originalCode} is the evidence snippet already stored, and
+     * {@code fixedCode} is the stored fix recommendation (ready for display as
+     * a diff in the UI until a real LLM call replaces it).
+     *
+     * @param auditId   the audit's database id
+     * @param request   carries the {@code findingId} (e.g. "AUDIT-001")
+     * @return an {@link Optional} with the fix response, or empty if not found
+     */
+    public Optional<FixResponse> fix(Long auditId, FixRequest request) {
+        return findingRepository
+                .findByAuditIdAndFindingRef(auditId, request.getFindingId())
+                .map(fe -> new FixResponse(
+                        fe.getFindingRef(),
+                        fe.getEvidence(),
+                        fe.getFix(),
+                        null));   // scoreAfter — reserved for future recalculation
+    }
+
+    /**
      * Applies an AI-generated minimal fix for the given finding, re-runs the relevant
      * category check to confirm resolution, then updates the finding and audit score.
      *
@@ -294,8 +316,8 @@ public class AuditService {
             }
             auditRepository.save(auditEntity);
 
-            // Step 6 — Return real response
-            return new AuditResponse(score, findings.size(), findings);
+            // Step 6 — Return real response (include persisted id so the frontend can call /fix)
+            return new AuditResponse(auditEntity.getId(), score, findings.size(), findings);
 
         } catch (IOException | InterruptedException e) {
             Thread.currentThread().interrupt();
@@ -679,6 +701,6 @@ public class AuditService {
                     return f;
                 })
                 .toList();
-        return new AuditResponse(entity.getScore(), entity.getFindingsCount(), findings);
+        return new AuditResponse(entity.getId(), entity.getScore(), entity.getFindingsCount(), findings);
     }
 }
