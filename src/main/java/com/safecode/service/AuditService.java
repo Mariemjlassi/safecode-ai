@@ -1,9 +1,13 @@
 package com.safecode.service;
 
+import com.safecode.entity.AuditEntity;
+import com.safecode.entity.FindingEntity;
 import com.safecode.model.AuditRequest;
 import com.safecode.model.AuditResponse;
 import com.safecode.model.Finding;
+import com.safecode.repository.AuditRepository;
 import org.springframework.stereotype.Service;
+import java.util.Optional;
 
 import java.io.IOException;
 import java.nio.charset.StandardCharsets;
@@ -36,6 +40,12 @@ import java.util.regex.Pattern;
  */
 @Service
 public class AuditService {
+
+    private final AuditRepository auditRepository;
+
+    public AuditService(AuditRepository auditRepository) {
+        this.auditRepository = auditRepository;
+    }
 
     // -----------------------------------------------------------------------
     // Category A — Access Control (ASVS V4)
@@ -125,6 +135,16 @@ public class AuditService {
     // -----------------------------------------------------------------------
 
     /**
+     * Retrieves a previously saved audit by its database id.
+     *
+     * @param id the primary key of the audit record
+     * @return an {@link Optional} containing the mapped {@link AuditResponse}, or empty if not found
+     */
+    public Optional<AuditResponse> findById(Long id) {
+        return auditRepository.findById(id).map(this::toResponse);
+    }
+
+    /**
      * Audits the repository at {@code request.getRepoUrl()}.
      *
      * @param request the audit request carrying the repository URL
@@ -143,6 +163,17 @@ public class AuditService {
 
             // Step 4 — Score: one category = 20 points; deduct for each failing category
             int score = calculateScore(findings);
+
+            // Step 5 — Persist audit + findings
+            AuditEntity auditEntity = new AuditEntity(request.getRepoUrl(), score, findings.size());
+            for (Finding f : findings) {
+                auditEntity.getFindings().add(new FindingEntity(
+                        f.getId(), f.getCategory(), f.getSeverity(),
+                        f.getFile(), f.getLine(),
+                        f.getIssue(), f.getEvidence(), f.getFix(),
+                        auditEntity));
+            }
+            auditRepository.save(auditEntity);
 
             // Step 6 — Return real response
             return new AuditResponse(score, findings.size(), findings);
@@ -457,5 +488,25 @@ public class AuditService {
     /** Returns true if the relative path should be skipped entirely. */
     private static boolean isExcluded(String relativePath) {
         return EXCLUDED_PREFIXES.stream().anyMatch(relativePath::startsWith);
+    }
+
+    // -----------------------------------------------------------------------
+    // Entity → model mapper
+    // -----------------------------------------------------------------------
+
+    /** Maps a persisted {@link AuditEntity} (with its findings) to an {@link AuditResponse}. */
+    private AuditResponse toResponse(AuditEntity entity) {
+        List<Finding> findings = entity.getFindings().stream()
+                .map(fe -> new Finding(
+                        fe.getFindingRef(),
+                        fe.getCategory(),
+                        fe.getSeverity(),
+                        fe.getFile(),
+                        fe.getLine(),
+                        fe.getIssue(),
+                        fe.getEvidence(),
+                        fe.getFix()))
+                .toList();
+        return new AuditResponse(entity.getScore(), entity.getFindingsCount(), findings);
     }
 }
